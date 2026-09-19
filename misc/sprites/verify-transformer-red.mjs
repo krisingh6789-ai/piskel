@@ -1,112 +1,57 @@
 /**
- * Verifies the generated "Transformer Red" .piskel file the same way the
- * Piskel editor loads it, without a browser:
+ * Verifies the generated "Transformer Red" assets without a browser.
  *
- *   1. read the file like FileReader + Base64.toText does
- *   2. JSON.parse it, check modelVersion against src/js/Constants.js
- *   3. run the same steps as pskl.utils.serialization.Deserializer:
- *      parse each layer, walk its chunks, slice frames using the chunk
- *      layout (see pskl.utils.FrameUtils.createFramesFromChunk)
- *   4. compare the decoded frames with the standalone sprite sheet
+ * For the .piskel file it replays the editor's own load path:
+ *   - JSON.parse like pskl.utils.PiskelFileUtils.decodePiskelFile
+ *   - modelVersion checked against src/js/Constants.js
+ *   - layers/chunks walked like pskl.utils.serialization.Deserializer, with
+ *     frames sliced by the chunk layout exactly as
+ *     pskl.utils.FrameUtils.createFramesFromChunk does
+ *
+ * For the .gif files it re-parses them with the project's own gifuct-js
+ * dependency and compares every frame back to the .piskel frames.
  *
  * Usage: node misc/sprites/verify-transformer-red.mjs
  */
 import fs from "node:fs";
 import path from "node:path";
-import zlib from "node:zlib";
 import assert from "node:assert";
 import { fileURLToPath } from "node:url";
+import { decompressFrames, parseGIF } from "gifuct-js";
+import { decodePng, flattenRgba, scaleRgba } from "./png.mjs";
+import { readPiskel } from "./piskel.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const NAME = "transformer-red";
+
+/** GIFs to check, with the options they were exported with. */
+const GIF_EXPECTATIONS = [
+  { file: `${NAME}.gif`, scale: 1, background: null },
+  { file: `${NAME}-preview.gif`, scale: 8, background: "#262a35" }
+];
 
 const constantsSrc = fs.readFileSync(
   path.join(__dirname, "../../src/js/Constants.js"),
   "utf8"
 );
-const modelVersion = Number(
+const expectedModelVersion = Number(
   constantsSrc.match(/MODEL_VERSION\s*[:=]\s*(\d+)/)[1]
 );
 
-/** Minimal PNG decoder for the files this script writes (8 bit RGBA, filter 0). */
-function decodePng(buffer) {
-  assert.equal(buffer.toString("hex", 0, 8), "89504e470d0a1a0a", "not a PNG");
-  let off = 8;
-  let width = 0;
-  let height = 0;
-  const idat = [];
-  while (off < buffer.length) {
-    const len = buffer.readUInt32BE(off);
-    const type = buffer.toString("ascii", off + 4, off + 8);
-    if (type === "IHDR") {
-      width = buffer.readUInt32BE(off + 8);
-      height = buffer.readUInt32BE(off + 12);
-      assert.equal(buffer[off + 16], 8, "expected 8 bit depth");
-      assert.equal(buffer[off + 17], 6, "expected RGBA colour type");
-    } else if (type === "IDAT") {
-      idat.push(buffer.subarray(off + 8, off + 8 + len));
-    } else if (type === "IEND") {
-      break;
-    }
-    off += 12 + len;
-  }
-  const raw = zlib.inflateSync(Buffer.concat(idat));
-  const stride = width * 4;
-  const pixels = Buffer.alloc(width * height * 4);
-  for (let y = 0; y < height; y++) {
-    const filter = raw[y * (stride + 1)];
-    assert.equal(filter, 0, `unsupported PNG filter ${filter}`);
-    raw.copy(
-      pixels,
-      y * stride,
-      y * (stride + 1) + 1,
-      y * (stride + 1) + 1 + stride
-    );
-  }
-  return { width, height, pixels };
-}
-
-/** Slice a horizontal spritesheet into frames, following the chunk layout. */
-function sliceLayout(image, layout) {
-  const frameWidth = image.width / layout.length;
-  const frameHeight = image.height / layout[0].length;
-  assert.ok(
-    Number.isInteger(frameWidth),
-    `non-integer frame width ${frameWidth}`
-  );
-  assert.ok(
-    Number.isInteger(frameHeight),
-    `non-integer frame height ${frameHeight}`
-  );
-
-  const frames = [];
-  for (let i = 0; i < layout.length; i++) {
-    for (let j = 0; j < layout[i].length; j++) {
-      const frame = Buffer.alloc(frameWidth * frameHeight * 4);
-      for (let y = 0; y < frameHeight; y++) {
-        const src = ((j * frameHeight + y) * image.width + i * frameWidth) * 4;
-        image.pixels.copy(frame, y * frameWidth * 4, src, src + frameWidth * 4);
-      }
-      frames[layout[i][j]] = {
-        index: layout[i][j],
-        width: frameWidth,
-        height: frameHeight,
-        pixels: frame
-      };
-    }
-  }
-  return frames;
-}
-
-/* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * 1. the .piskel file
+ * ------------------------------------------------------------------ */
 const file = path.join(__dirname, `${NAME}.piskel`);
-const rawPiskel = fs.readFileSync(file, "utf8");
+const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
 
-const parsed = JSON.parse(rawPiskel); // what decodePiskelFile does
 console.log(
-  `modelVersion in file: ${parsed.modelVersion} (editor expects ${modelVersion})`
+  `modelVersion in file: ${parsed.modelVersion} (editor expects ${expectedModelVersion})`
 );
-assert.equal(parsed.modelVersion, modelVersion, "modelVersion mismatch");
+assert.equal(
+  parsed.modelVersion,
+  expectedModelVersion,
+  "modelVersion mismatch"
+);
 
 const descriptor = parsed.piskel;
 const layerData = JSON.parse(descriptor.layers[0]);
@@ -114,71 +59,65 @@ console.log(
   `sprite: ${descriptor.width}x${descriptor.height} @ ${descriptor.fps}fps, ` +
     `${layerData.frameCount} frames, layer "${layerData.name}" (opacity ${layerData.opacity})`
 );
-assert.equal(descriptor.width, 32);
-assert.equal(descriptor.height, 32);
-assert.ok(descriptor.fps > 0);
+assert.equal(descriptor.layers.length, 1, "expected a single layer");
+assert.ok(descriptor.fps > 0, "fps must be positive");
+assert.equal(layerData.opacity, 1);
 
-let decoded = 0;
-const frames = [];
-layerData.chunks.forEach((chunk, ci) => {
+layerData.chunks.forEach((chunk, index) => {
   assert.ok(
     chunk.base64PNG.startsWith("data:image/png"),
-    `chunk ${ci} is not a PNG data URI`
+    `chunk ${index} is not a PNG data URI`
   );
   assert.equal(
     chunk.base64PNG,
     chunk.base64PNG.trim(),
-    `chunk ${ci} has whitespace`
+    `chunk ${index} has whitespace`
   );
   const image = decodePng(Buffer.from(chunk.base64PNG.split(",")[1], "base64"));
-  const chunkFrames = sliceLayout(image, chunk.layout);
   console.log(
-    `  chunk ${ci}: ${image.width}x${image.height} px, layout ${JSON.stringify(chunk.layout)} -> ` +
-      `frames ${chunkFrames.map((f) => f.index).join(", ")}`
+    `  chunk ${index}: ${image.width}x${image.height} px, layout ${JSON.stringify(chunk.layout)}`
   );
-  chunkFrames.forEach((frame) => {
-    frames[frame.index] = frame;
-    decoded++;
-  });
 });
+
+const piskel = readPiskel(file);
 assert.equal(
-  decoded,
+  piskel.frames.length,
   layerData.frameCount,
   "decoded frame count != layer frameCount"
 );
+console.log(`all ${piskel.frames.length} frames decoded from the layer chunks`);
 
-/* Compare the decoded spritesheet frames against the standalone .png. */
+/* The embedded sheet and the standalone .png must agree pixel for pixel. */
 const sheet = decodePng(fs.readFileSync(path.join(__dirname, `${NAME}.png`)));
-assert.equal(sheet.width, 32 * layerData.frameCount);
-assert.equal(sheet.height, 32);
-for (let i = 0; i < layerData.frameCount; i++) {
-  const frame = frames[i];
-  for (let y = 0; y < 32; y++) {
-    const a = y * 32 * 4;
-    const b = (y * sheet.width + i * 32) * 4;
+assert.equal(sheet.width, piskel.width * piskel.frames.length);
+assert.equal(sheet.height, piskel.height);
+for (let i = 0; i < piskel.frames.length; i++) {
+  const frame = piskel.frames[i];
+  for (let y = 0; y < piskel.height; y++) {
+    const a = y * piskel.width * 4;
+    const b = (y * sheet.width + i * piskel.width) * 4;
     assert.ok(
       frame.pixels
-        .subarray(a, a + 32 * 4)
-        .equals(sheet.pixels.subarray(b, b + 32 * 4)),
+        .subarray(a, a + piskel.width * 4)
+        .equals(sheet.pixels.subarray(b, b + piskel.width * 4)),
       `frame ${i} row ${y} differs from the sheet`
     );
   }
 }
-console.log(
-  `all ${layerData.frameCount} frames decoded and match ${NAME}.png exactly`
-);
+console.log(`every frame matches ${NAME}.png exactly`);
 
-/* Transparency sanity: frames must have transparent padding around the art. */
-for (let i = 0; i < frames.length; i++) {
-  const p = frames[i].pixels;
-  const opaque = [];
-  for (let idx = 0; idx < 32 * 32; idx++) {
-    if (p[idx * 4 + 3] > 0) {
-      opaque.push([idx % 32, Math.floor(idx / 32)]);
+/* Transparency sanity: no frame may be clipped by the canvas edge. */
+for (let i = 0; i < piskel.frames.length; i++) {
+  const { pixels } = piskel.frames[i];
+  const xs = [];
+  const ys = [];
+  for (let index = 0; index < piskel.width * piskel.height; index++) {
+    if (pixels[index * 4 + 3] === 0) {
+      continue;
     }
+    xs.push(index % piskel.width);
+    ys.push(Math.floor(index / piskel.width));
   }
-  const xs = opaque.map((o) => o[0]);
-  const ys = opaque.map((o) => o[1]);
   const box = [
     Math.min(...xs),
     Math.min(...ys),
@@ -186,12 +125,167 @@ for (let i = 0; i < frames.length; i++) {
     Math.max(...ys)
   ];
   assert.ok(
-    box[0] > 0 && box[1] > 0 && box[2] < 31 && box[3] < 31,
+    box[0] > 0 &&
+      box[1] > 0 &&
+      box[2] < piskel.width - 1 &&
+      box[3] < piskel.height - 1,
     `frame ${i} is clipped: ${box}`
   );
   console.log(
-    `  frame ${i}: art box x${box[0]}..${box[2]} y${box[1]}..${box[3]}, ${opaque.length} opaque px`
+    `  frame ${i}: art box x${box[0]}..${box[2]} y${box[1]}..${box[3]}, ${xs.length} opaque px`
   );
 }
 
-console.log("\nOK - transformer-red.piskel is valid and loads cleanly.");
+/* ------------------------------------------------------------------ *
+ * 2. the .gif exports
+ * ------------------------------------------------------------------ */
+const expectedDelayCs = Math.max(2, Math.round(100 / piskel.fps));
+
+for (const { file: gifFile, scale, background } of GIF_EXPECTATIONS) {
+  const gifPath = path.join(__dirname, gifFile);
+  if (!fs.existsSync(gifPath)) {
+    console.warn(`  (skipped ${gifFile}: not generated)`);
+    continue;
+  }
+
+  const buffer = fs.readFileSync(gifPath);
+  assert.equal(
+    buffer.toString("ascii", 0, 6),
+    "GIF89a",
+    `${gifFile} is not a GIF89a file`
+  );
+  const parsedGif = parseGIF(
+    buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength
+    )
+  );
+  const gifFrames = decompressFrames(parsedGif, true);
+
+  const width = piskel.width * scale;
+  const height = piskel.height * scale;
+  assert.equal(parsedGif.lsd.width, width, `${gifFile}: wrong width`);
+  assert.equal(parsedGif.lsd.height, height, `${gifFile}: wrong height`);
+  assert.equal(
+    gifFrames.length,
+    piskel.frames.length,
+    `${gifFile}: wrong frame count`
+  );
+  // gifuct-js stores its application-extension entry as an empty frame, so
+  // count the real image descriptors as well.
+  const imageDescriptors = parsedGif.frames.filter(
+    (frame) => frame.image
+  ).length;
+  assert.equal(
+    imageDescriptors,
+    piskel.frames.length,
+    `${gifFile}: ${imageDescriptors} image descriptors, expected ${piskel.frames.length}`
+  );
+
+  // Looping is declared by the NETSCAPE2.0 application extension; gifuct-js
+  // does not surface it, so read it straight out of the byte stream.
+  const netscapeAt = buffer.indexOf(Buffer.from("NETSCAPE2.0", "ascii"));
+  assert.ok(
+    netscapeAt > 0,
+    `${gifFile}: missing the netscape looping extension`
+  );
+  const loopBlock = netscapeAt + "NETSCAPE2.0".length;
+  assert.equal(buffer[loopBlock], 0x03, `${gifFile}: malformed loop sub-block`);
+  assert.equal(
+    buffer[loopBlock + 1],
+    0x01,
+    `${gifFile}: malformed loop sub-block`
+  );
+  const loopCount = buffer.readUInt16LE(loopBlock + 2);
+  assert.equal(
+    buffer[loopBlock + 4],
+    0x00,
+    `${gifFile}: unterminated loop sub-block`
+  );
+
+  // What each frame should look like, given how the export was configured.
+  const expectedFrames = piskel.frames.map((frame) => {
+    let expected = frame;
+    if (background) {
+      expected = flattenRgba(expected, background);
+    }
+    if (scale > 1) {
+      expected = scaleRgba(expected, scale);
+    }
+    return expected;
+  });
+
+  gifFrames.forEach((gifFrame, index) => {
+    // gifuct-js reports delays in milliseconds, the file stores centiseconds
+    assert.equal(
+      gifFrame.delay,
+      expectedDelayCs * 10,
+      `${gifFile}: frame ${index} delay`
+    );
+    assert.equal(
+      gifFrame.disposalType,
+      2,
+      `${gifFile}: frame ${index} disposal type`
+    );
+    assert.equal(
+      gifFrame.dims.width,
+      width,
+      `${gifFile}: frame ${index} width`
+    );
+    assert.equal(
+      gifFrame.dims.height,
+      height,
+      `${gifFile}: frame ${index} height`
+    );
+
+    const expected = expectedFrames[index];
+    let mismatched = 0;
+    for (let i = 0; i < width * height; i++) {
+      const actualAlpha = gifFrame.patch[i * 4 + 3];
+      const expectedAlpha = expected.pixels[i * 4 + 3];
+      if (expectedAlpha === 0) {
+        // transparent pixel: it must be drawn with the transparent index
+        if (actualAlpha !== 0) {
+          mismatched++;
+        }
+        continue;
+      }
+      if (
+        gifFrame.patch[i * 4] !== expected.pixels[i * 4] ||
+        gifFrame.patch[i * 4 + 1] !== expected.pixels[i * 4 + 1] ||
+        gifFrame.patch[i * 4 + 2] !== expected.pixels[i * 4 + 2]
+      ) {
+        mismatched++;
+      }
+    }
+    assert.equal(
+      mismatched,
+      0,
+      `${gifFile}: frame ${index} has ${mismatched} mismatched pixels`
+    );
+  });
+
+  const colours = new Set();
+  piskel.frames.forEach((frame) => {
+    for (let i = 0; i < piskel.width * piskel.height; i++) {
+      if (frame.pixels[i * 4 + 3] === 0) {
+        continue;
+      }
+      colours.add(
+        (frame.pixels[i * 4] << 16) |
+          (frame.pixels[i * 4 + 1] << 8) |
+          frame.pixels[i * 4 + 2]
+      );
+    }
+  });
+
+  console.log(
+    `${gifFile}: ${parsedGif.lsd.width}x${parsedGif.lsd.height}, ${gifFrames.length} frames, ` +
+      `${gifFrames[0].delay}ms/frame (~${(1000 / gifFrames[0].delay).toFixed(1)}fps), ` +
+      `${colours.size} colours${background ? `, background ${background}` : ", transparent"}, ` +
+      `loops ${loopCount === 0 ? "forever" : `${loopCount}x`}, ` +
+      `${(buffer.length / 1024).toFixed(1)} kB - all frames match`
+  );
+}
+
+console.log(`\nOK - ${NAME} assets are valid and load cleanly.`);

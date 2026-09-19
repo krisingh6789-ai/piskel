@@ -20,8 +20,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import { encodePng, hexToRgb } from "./png.mjs";
+import { framesToSheet, serializePiskel } from "./piskel.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -397,85 +398,24 @@ const FRAME_SPECS = [
   { pose: "stand", bob: 0, fist: 0, visor: "C" }
 ];
 
-/* ------------------------------------------------------------------ *
- * PNG encoding (RGBA, no dependencies)
- * ------------------------------------------------------------------ */
-function hexToRgb(hex) {
-  return [
-    parseInt(hex.slice(1, 3), 16),
-    parseInt(hex.slice(3, 5), 16),
-    parseInt(hex.slice(5, 7), 16)
-  ];
-}
-
-const CRC_TABLE = (() => {
-  const t = new Int32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    t[n] = c;
-  }
-  return t;
-})();
-
-function crc32(buf) {
-  let c = -1;
-  for (let i = 0; i < buf.length; i++) {
-    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  }
-  return (c ^ -1) >>> 0;
-}
-
-function pngChunk(type, data) {
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(data.length);
-  const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
-  const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body));
-  return Buffer.concat([len, body, crc]);
-}
-
-function encodePng(width, height, rgba) {
-  const raw = Buffer.alloc(height * (width * 4 + 1));
-  for (let y = 0; y < height; y++) {
-    rgba.copy(raw, y * (width * 4 + 1) + 1, y * width * 4, (y + 1) * width * 4);
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // colour type RGBA
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    pngChunk("IHDR", ihdr),
-    pngChunk("IDAT", zlib.deflateSync(raw, { level: 9 })),
-    pngChunk("IEND", Buffer.alloc(0))
-  ]);
-}
-
-/** Flatten one grid per frame into a horizontal sprite sheet (RGBA). */
-function framesToSheet(frames) {
-  const w = WIDTH * frames.length;
-  const buf = Buffer.alloc(w * HEIGHT * 4);
-  frames.forEach((frame, idx) => {
-    for (let y = 0; y < HEIGHT; y++) {
-      for (let x = 0; x < WIDTH; x++) {
-        const rgb = PALETTE[frame.get(x, y)];
-        if (!rgb) {
-          continue;
-        }
-        const [r, g, b] = hexToRgb(rgb);
-        const i = (y * w + idx * WIDTH + x) * 4;
-        buf[i] = r;
-        buf[i + 1] = g;
-        buf[i + 2] = b;
-        buf[i + 3] = 255;
+/** Convert one grid into an RGBA frame buffer. */
+function gridToRgba(grid) {
+  const pixels = Buffer.alloc(grid.w * grid.h * 4);
+  for (let y = 0; y < grid.h; y++) {
+    for (let x = 0; x < grid.w; x++) {
+      const rgb = PALETTE[grid.get(x, y)];
+      if (!rgb) {
+        continue;
       }
+      const [r, g, b] = hexToRgb(rgb);
+      const i = (y * grid.w + x) * 4;
+      pixels[i] = r;
+      pixels[i + 1] = g;
+      pixels[i + 2] = b;
+      pixels[i + 3] = 255;
     }
-  });
-  return { buf, w, h: HEIGHT };
+  }
+  return { width: grid.w, height: grid.h, pixels };
 }
 
 /** 8x nearest-neighbour strip, for design review. */
@@ -519,10 +459,11 @@ function writePreview(frames, file) {
 /* ------------------------------------------------------------------ *
  * Main
  * ------------------------------------------------------------------ */
-const frames = FRAME_SPECS.map(buildFrame);
+const grids = FRAME_SPECS.map(buildFrame);
+const frames = grids.map(gridToRgba);
 
 // Validate every frame: only palette characters, and nothing clipped.
-frames.forEach((frame, i) => {
+grids.forEach((frame, i) => {
   const bad = [];
   frame.px.forEach((c, idx) => {
     if (typeof c !== "string" || (c !== "." && !(c in PALETTE))) {
@@ -553,44 +494,29 @@ frames.forEach((frame, i) => {
   }
 });
 
-const sheet = framesToSheet(frames);
-const sheetPng = encodePng(sheet.w, sheet.h, sheet.buf);
-fs.writeFileSync(path.join(__dirname, `${NAME}.png`), sheetPng);
-
-const layer = {
-  name: "Layer 1",
-  opacity: 1,
-  frameCount: frames.length,
-  chunks: [
-    {
-      layout: frames.map((_, i) => [i]),
-      base64PNG: `data:image/png;base64,${sheetPng.toString("base64")}`
-    }
-  ]
-};
+const sheet = framesToSheet(frames, WIDTH, HEIGHT);
 fs.writeFileSync(
-  path.join(__dirname, `${NAME}.piskel`),
-  JSON.stringify({
-    modelVersion: 2,
-    piskel: {
-      name: NAME,
-      description: "Red Transformer - 6 frame idle loop",
-      fps: FPS,
-      height: HEIGHT,
-      width: WIDTH,
-      layers: [JSON.stringify(layer)],
-      hiddenFrames: []
-    }
-  })
+  path.join(__dirname, `${NAME}.png`),
+  encodePng(sheet.width, sheet.height, sheet.pixels)
 );
 
-writePreview(frames, path.join(__dirname, `${NAME}-preview.png`));
+const piskel = serializePiskel({
+  name: NAME,
+  description: "Red Transformer - 6 frame idle loop",
+  width: WIDTH,
+  height: HEIGHT,
+  fps: FPS,
+  frames
+});
+fs.writeFileSync(path.join(__dirname, `${NAME}.piskel`), piskel.json);
+
+writePreview(grids, path.join(__dirname, `${NAME}-preview.png`));
 
 if (process.argv.includes("--ascii")) {
-  console.log(`--- frame 0 ---\n${frames[0].toAscii()}`);
+  console.log(`--- frame 0 ---\n${grids[0].toAscii()}`);
 }
 
 console.log(
   `Wrote ${NAME}.piskel (${WIDTH}x${HEIGHT}, ${frames.length} frames @ ${FPS}fps, ` +
-    `${frames[0].painted()} px in frame 0)`
+    `${grids[0].painted()} px in frame 0)`
 );
